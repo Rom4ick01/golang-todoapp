@@ -1,0 +1,109 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	core_config "todoapp/internal/core/config"
+	core_logger "todoapp/internal/core/logger"
+	core_pgx_pool "todoapp/internal/core/repository/postgres/pool/pgx"
+	core_http_middleware "todoapp/internal/core/transport/http/middleware"
+	core_http_server "todoapp/internal/core/transport/http/server"
+	statistics_postgres_repository "todoapp/internal/features/statistics/repository/postgres"
+	statistics_service "todoapp/internal/features/statistics/service"
+	statistics_transport_http "todoapp/internal/features/statistics/transport/http"
+	tasks_postgres_repository "todoapp/internal/features/tasks/repository/postgres"
+	tasks_service "todoapp/internal/features/tasks/service"
+	tasks_transport_http "todoapp/internal/features/tasks/transport/http"
+	users_postgres_repository "todoapp/internal/features/users/repository/postgres"
+	users_service "todoapp/internal/features/users/service"
+	users_transport_http "todoapp/internal/features/users/transport/http"
+	web_fs_repository "todoapp/internal/features/web/repository/file_system"
+	web_service "todoapp/internal/features/web/service"
+	web_transport_http "todoapp/internal/features/web/transport/http"
+
+	"go.uber.org/zap"
+
+	_ "todoapp/docs"
+)
+
+func main() {
+	cfg := core_config.NewConfigMust()
+	time.Local = cfg.TimeZone
+
+	ctx, cancel := signal.NotifyContext(
+		context.Background(),
+		syscall.SIGINT, syscall.SIGTERM,
+	)
+	defer cancel()
+
+	logger, err := core_logger.NewLogger(core_logger.NewConfigMust())
+	if err != nil {
+		fmt.Println("failed to init application logger:", err)
+		os.Exit(1)
+	}
+	defer logger.Close()
+
+	logger.Debug("application time zone", zap.Any("zone", time.Local))
+
+	logger.Debug("initializing postgres connection pool")
+	postgresPool, err := core_pgx_pool.NewPool(
+		ctx,
+		core_pgx_pool.NewConfigMust(),
+	)
+	if err != nil {
+		logger.Fatal("failed to init postgres connection pool", zap.Error(err))
+	}
+	defer postgresPool.Close()
+
+	logger.Debug("initializing feature", zap.String("feature", "users"))
+	usersRepository := users_postgres_repository.NewUsersRepository(postgresPool)
+	usersService := users_service.NewUsersService(usersRepository)
+	usersTransportHTTP := users_transport_http.NewUsersHTTPHandler(usersService)
+
+	logger.Debug("initializing feature", zap.String("feature", "tasks"))
+	tasksRepository := tasks_postgres_repository.NewTasksRepository(postgresPool)
+	tasksService := tasks_service.NewTasksService(tasksRepository)
+	tasksTransportHTTP := tasks_transport_http.NewTasksHTTPHandler(tasksService)
+
+	logger.Debug("initializing feature", zap.String("feature", "statistics"))
+	statisticsRepository := statistics_postgres_repository.NewStatisticsRepository(postgresPool)
+	statisticsService := statistics_service.NewStatisticsService(statisticsRepository)
+	statisticsTransportHTTP := statistics_transport_http.NewStatisticsHTTPHandler(statisticsService)
+
+	logger.Debug("initializing feature", zap.String("feature", "web"))
+	webRepository := web_fs_repository.NewWebRepository()
+	webService := web_service.NewWebService(webRepository)
+	webTransportHTTP := web_transport_http.NewWebHTTPHandler(webService)
+
+	logger.Debug("initializing HTTP server")
+	httpConfig := core_http_server.NewConfigMust()
+	httpServer := core_http_server.NewHTTPServer(
+		httpConfig,
+		logger,
+		core_http_middleware.CORS(httpConfig.AllowedOrigins),
+		core_http_middleware.RequestID(),
+		core_http_middleware.Logger(logger),
+		core_http_middleware.Trace(),
+		core_http_middleware.Panic(),
+	)
+
+	apiVersionRouterV1 := core_http_server.NewAPIVersionRouter(core_http_server.ApiVersion1)
+	apiVersionRouterV1.AddRoutes(usersTransportHTTP.Routes()...)
+	apiVersionRouterV1.AddRoutes(tasksTransportHTTP.Routes()...)
+	apiVersionRouterV1.AddRoutes(statisticsTransportHTTP.Routes()...)
+
+	httpServer.RegisterAPIRouters(
+		apiVersionRouterV1,
+	)
+	httpServer.RegisterRoutes(webTransportHTTP.Routes()...)
+	httpServer.RegisterSwagger()
+
+	if err := httpServer.Run(ctx); err != nil {
+		logger.Error("HTTP server run error", zap.Error(err))
+	}
+}
