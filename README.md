@@ -117,7 +117,8 @@ make env-down          # PostgreSQL
 
 ```
 .
-├── cmd/todoapp/            # main.go — точка входа и сборка зависимостей; Dockerfile
+├── cmd/todoapp/            # main.go — точка входа и сборка зависимостей
+├── Dockerfile              # сборка образа приложения (make todoapp-deploy)
 ├── internal/
 │   ├── core/               # общий код, не привязанный к фичам
 │   │   ├── config/         # общая конфигурация (часовой пояс)
